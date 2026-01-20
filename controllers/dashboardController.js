@@ -1,49 +1,76 @@
-import db from '../config/database.js';
+import Employee from '../models/Employee.js';
+import Department from '../models/Department.js';
+import Attendance from '../models/Attendance.js';
 
 export const getDashboardStats = async (req, res, next) => {
   try {
-    const totalEmployees = await db.get('SELECT COUNT(*) as count FROM employees');
-    const activeEmployees = await db.get("SELECT COUNT(*) as count FROM employees WHERE status = 'active'");
-    const totalDepartments = await db.get('SELECT COUNT(*) as count FROM departments');
+    const totalEmployees = await Employee.countDocuments();
+    const activeEmployees = await Employee.countDocuments({ status: 'active' });
+    const totalDepartments = await Department.countDocuments();
     
     // Today's attendance stats
-    const today = new Date().toISOString().split('T')[0];
-    const todayAttendance = await db.get(
-      `SELECT COUNT(*) as count FROM attendance WHERE date = ?`,
-      [today]
-    );
-    const todayPresent = await db.get(
-      `SELECT COUNT(*) as count FROM attendance WHERE date = ? AND status = 'present'`,
-      [today]
-    );
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
     
-    const employeesByDept = await db.all(`
-      SELECT d.name, COUNT(e.id) as count 
-      FROM departments d 
-      LEFT JOIN employees e ON d.id = e.department_id 
-      GROUP BY d.id, d.name 
-      ORDER BY count DESC 
-      LIMIT 5
-    `);
+    const todayAttendance = await Attendance.countDocuments({
+      date: { $gte: today, $lt: tomorrow }
+    });
+    const todayPresent = await Attendance.countDocuments({
+      date: { $gte: today, $lt: tomorrow },
+      status: 'present'
+    });
+    
+    // Employees by department
+    const employeesByDept = await Department.aggregate([
+      {
+        $lookup: {
+          from: 'employees',
+          localField: '_id',
+          foreignField: 'department_id',
+          as: 'employees'
+        }
+      },
+      {
+        $project: {
+          name: 1,
+          count: { $size: '$employees' }
+        }
+      },
+      {
+        $sort: { count: -1 }
+      },
+      {
+        $limit: 5
+      }
+    ]);
 
-    const recentHires = await db.all(`
-      SELECT e.*, d.name as department_name 
-      FROM employees e 
-      LEFT JOIN departments d ON e.department_id = d.id 
-      ORDER BY e.hire_date DESC 
-      LIMIT 5
-    `);
+    // Recent hires
+    const recentHires = await Employee.find()
+      .populate('department_id', 'name')
+      .sort({ hire_date: -1 })
+      .limit(5)
+      .lean();
+
+    // Format recent hires
+    const formattedRecentHires = recentHires.map(emp => ({
+      ...emp,
+      id: emp._id,
+      department_name: emp.department_id?.name || null,
+      department_id: emp.department_id?._id || null
+    }));
 
     res.status(200).json({
       success: true,
       data: {
-        totalEmployees: totalEmployees.count,
-        activeEmployees: activeEmployees.count,
-        totalDepartments: totalDepartments.count,
-        todayAttendance: todayAttendance.count,
-        todayPresent: todayPresent.count,
+        totalEmployees,
+        activeEmployees,
+        totalDepartments,
+        todayAttendance,
+        todayPresent,
         employeesByDepartment: employeesByDept,
-        recentHires
+        recentHires: formattedRecentHires
       }
     });
   } catch (error) {

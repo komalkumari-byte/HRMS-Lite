@@ -1,38 +1,38 @@
-import db from '../config/database.js';
-import { NotFoundError, ConflictError, ValidationError } from '../middleware/errorHandler.js';
+import Employee from '../models/Employee.js';
+import Department from '../models/Department.js';
+import { NotFoundError, ConflictError } from '../middleware/errorHandler.js';
 
 export const getAllEmployees = async (req, res, next) => {
   try {
     const { search, department_id, status } = req.query;
-    let query = `
-      SELECT e.*, d.name as department_name 
-      FROM employees e 
-      LEFT JOIN departments d ON e.department_id = d.id
-      WHERE 1=1
-    `;
-    const params = [];
-
+    
+    let query = {};
+    
+    // Build search query
     if (search) {
-      query += ` AND (e.first_name LIKE ? OR e.last_name LIKE ? OR e.email LIKE ? OR e.position LIKE ?)`;
-      const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      query.$or = [
+        { first_name: { $regex: search, $options: 'i' } },
+        { last_name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { position: { $regex: search, $options: 'i' } }
+      ];
     }
 
+    // Filter by department
     if (department_id) {
-      // Validate department_id if provided
-      const deptId = parseInt(department_id);
-      if (isNaN(deptId) || deptId < 1) {
+      // Validate MongoDB ObjectId
+      if (!/^[0-9a-fA-F]{24}$/.test(department_id)) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Invalid department ID',
-          details: [{ field: 'department_id', message: 'Department ID must be a positive integer' }]
+          details: [{ field: 'department_id', message: 'Department ID must be a valid MongoDB ObjectId' }]
         });
       }
-      query += ` AND e.department_id = ?`;
-      params.push(deptId);
+      query.department_id = department_id;
     }
 
+    // Filter by status
     if (status) {
       if (!['active', 'inactive'].includes(status)) {
         return res.status(400).json({
@@ -42,18 +42,26 @@ export const getAllEmployees = async (req, res, next) => {
           details: [{ field: 'status', message: 'Status must be either "active" or "inactive"' }]
         });
       }
-      query += ` AND e.status = ?`;
-      params.push(status);
+      query.status = status;
     }
 
-    query += ` ORDER BY e.created_at DESC`;
+    const employees = await Employee.find(query)
+      .populate('department_id', 'name')
+      .sort({ createdAt: -1 })
+      .lean();
 
-    const employees = await db.all(query, params);
-    
+    // Transform to match expected format
+    const formattedEmployees = employees.map(emp => ({
+      ...emp,
+      id: emp._id,
+      department_name: emp.department_id?.name || null,
+      department_id: emp.department_id?._id || null
+    }));
+
     res.status(200).json({
       success: true,
-      data: employees,
-      count: employees.length
+      data: formattedEmployees,
+      count: formattedEmployees.length
     });
   } catch (error) {
     next(error);
@@ -64,32 +72,35 @@ export const getEmployeeById = async (req, res, next) => {
   try {
     const { id } = req.params;
     
-    // Validate ID
-    const employeeId = parseInt(id);
-    if (isNaN(employeeId) || employeeId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid employee ID',
-        details: [{ field: 'id', message: 'Employee ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
       });
     }
 
-    const employee = await db.get(
-      `SELECT e.*, d.name as department_name 
-       FROM employees e 
-       LEFT JOIN departments d ON e.department_id = d.id 
-       WHERE e.id = ?`,
-      [employeeId]
-    );
+    const employee = await Employee.findById(id)
+      .populate('department_id', 'name')
+      .lean();
 
     if (!employee) {
       throw new NotFoundError('Employee not found');
     }
 
+    // Transform to match expected format
+    const formattedEmployee = {
+      ...employee,
+      id: employee._id,
+      department_name: employee.department_id?.name || null,
+      department_id: employee.department_id?._id || null
+    };
+
     res.status(200).json({
       success: true,
-      data: employee
+      data: formattedEmployee
     });
   } catch (error) {
     next(error);
@@ -110,25 +121,24 @@ export const createEmployee = async (req, res, next) => {
       status
     } = req.body;
 
-    // Check if email already exists (duplicate handling)
-    const existing = await db.get('SELECT * FROM employees WHERE email = ?', [email]);
+    // Check if email already exists
+    const existing = await Employee.findOne({ email: email.toLowerCase().trim() });
     if (existing) {
       throw new ConflictError('Employee with this email already exists');
     }
 
     // Validate department_id if provided
     if (department_id) {
-      const deptId = parseInt(department_id);
-      if (isNaN(deptId) || deptId < 1) {
+      if (!/^[0-9a-fA-F]{24}$/.test(department_id)) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Invalid department ID',
-          details: [{ field: 'department_id', message: 'Department ID must be a positive integer' }]
+          details: [{ field: 'department_id', message: 'Department ID must be a valid MongoDB ObjectId' }]
         });
       }
       
-      const department = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
+      const department = await Department.findById(department_id);
       if (!department) {
         return res.status(400).json({
           success: false,
@@ -151,7 +161,6 @@ export const createEmployee = async (req, res, next) => {
         });
       }
       
-      // Check if hire date is in the future
       if (hireDate > new Date()) {
         return res.status(400).json({
           success: false,
@@ -162,37 +171,40 @@ export const createEmployee = async (req, res, next) => {
       }
     }
 
-    const result = await db.run(
-      `INSERT INTO employees 
-       (first_name, last_name, email, phone, position, department_id, hire_date, salary, status) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        first_name.trim(),
-        last_name.trim(),
-        email.toLowerCase().trim(),
-        phone ? phone.trim() : null,
-        position.trim(),
-        department_id ? parseInt(department_id) : null,
-        hire_date || null,
-        salary ? parseFloat(salary) : null,
-        status || 'active'
-      ]
-    );
+    const employee = new Employee({
+      first_name: first_name.trim(),
+      last_name: last_name.trim(),
+      email: email.toLowerCase().trim(),
+      phone: phone ? phone.trim() : null,
+      position: position.trim(),
+      department_id: department_id || null,
+      hire_date: hire_date || null,
+      salary: salary ? parseFloat(salary) : null,
+      status: status || 'active'
+    });
 
-    const employee = await db.get(
-      `SELECT e.*, d.name as department_name 
-       FROM employees e 
-       LEFT JOIN departments d ON e.department_id = d.id 
-       WHERE e.id = ?`,
-      [result.lastID]
-    );
+    await employee.save();
+
+    const savedEmployee = await Employee.findById(employee._id)
+      .populate('department_id', 'name')
+      .lean();
+
+    const formattedEmployee = {
+      ...savedEmployee,
+      id: savedEmployee._id,
+      department_name: savedEmployee.department_id?.name || null,
+      department_id: savedEmployee.department_id?._id || null
+    };
 
     res.status(201).json({
       success: true,
       message: 'Employee created successfully',
-      data: employee
+      data: formattedEmployee
     });
   } catch (error) {
+    if (error.code === 11000) {
+      return next(new ConflictError('Employee with this email already exists'));
+    }
     next(error);
   }
 };
@@ -200,15 +212,14 @@ export const createEmployee = async (req, res, next) => {
 export const updateEmployee = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const employeeId = parseInt(id);
     
-    // Validate ID
-    if (isNaN(employeeId) || employeeId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid employee ID',
-        details: [{ field: 'id', message: 'Employee ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
       });
     }
 
@@ -225,14 +236,17 @@ export const updateEmployee = async (req, res, next) => {
     } = req.body;
 
     // Check if employee exists
-    const existing = await db.get('SELECT * FROM employees WHERE id = ?', [employeeId]);
+    const existing = await Employee.findById(id);
     if (!existing) {
       throw new NotFoundError('Employee not found');
     }
 
-    // Check if email is taken by another employee (duplicate handling)
+    // Check if email is taken by another employee
     if (email && email.toLowerCase().trim() !== existing.email.toLowerCase()) {
-      const emailExists = await db.get('SELECT * FROM employees WHERE email = ? AND id != ?', [email.toLowerCase().trim(), employeeId]);
+      const emailExists = await Employee.findOne({ 
+        email: email.toLowerCase().trim(), 
+        _id: { $ne: id } 
+      });
       if (emailExists) {
         throw new ConflictError('Email already taken by another employee');
       }
@@ -240,17 +254,16 @@ export const updateEmployee = async (req, res, next) => {
 
     // Validate department_id if provided
     if (department_id) {
-      const deptId = parseInt(department_id);
-      if (isNaN(deptId) || deptId < 1) {
+      if (!/^[0-9a-fA-F]{24}$/.test(department_id)) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Invalid department ID',
-          details: [{ field: 'department_id', message: 'Department ID must be a positive integer' }]
+          details: [{ field: 'department_id', message: 'Department ID must be a valid MongoDB ObjectId' }]
         });
       }
       
-      const department = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
+      const department = await Department.findById(department_id);
       if (!department) {
         return res.status(400).json({
           success: false,
@@ -274,39 +287,39 @@ export const updateEmployee = async (req, res, next) => {
       }
     }
 
-    await db.run(
-      `UPDATE employees 
-       SET first_name = ?, last_name = ?, email = ?, phone = ?, position = ?, 
-           department_id = ?, hire_date = ?, salary = ?, status = ?, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [
-        first_name ? first_name.trim() : existing.first_name,
-        last_name ? last_name.trim() : existing.last_name,
-        email ? email.toLowerCase().trim() : existing.email,
-        phone !== undefined ? (phone ? phone.trim() : null) : existing.phone,
-        position ? position.trim() : existing.position,
-        department_id ? parseInt(department_id) : existing.department_id,
-        hire_date || existing.hire_date,
-        salary !== undefined ? (salary ? parseFloat(salary) : null) : existing.salary,
-        status || existing.status,
-        employeeId
-      ]
-    );
+    // Update employee
+    if (first_name) existing.first_name = first_name.trim();
+    if (last_name) existing.last_name = last_name.trim();
+    if (email) existing.email = email.toLowerCase().trim();
+    if (phone !== undefined) existing.phone = phone ? phone.trim() : null;
+    if (position) existing.position = position.trim();
+    if (department_id !== undefined) existing.department_id = department_id || null;
+    if (hire_date !== undefined) existing.hire_date = hire_date || null;
+    if (salary !== undefined) existing.salary = salary ? parseFloat(salary) : null;
+    if (status) existing.status = status;
 
-    const employee = await db.get(
-      `SELECT e.*, d.name as department_name 
-       FROM employees e 
-       LEFT JOIN departments d ON e.department_id = d.id 
-       WHERE e.id = ?`,
-      [employeeId]
-    );
+    await existing.save();
+
+    const updatedEmployee = await Employee.findById(id)
+      .populate('department_id', 'name')
+      .lean();
+
+    const formattedEmployee = {
+      ...updatedEmployee,
+      id: updatedEmployee._id,
+      department_name: updatedEmployee.department_id?.name || null,
+      department_id: updatedEmployee.department_id?._id || null
+    };
 
     res.status(200).json({
       success: true,
       message: 'Employee updated successfully',
-      data: employee
+      data: formattedEmployee
     });
   } catch (error) {
+    if (error.code === 11000) {
+      return next(new ConflictError('Email already taken by another employee'));
+    }
     next(error);
   }
 };
@@ -314,42 +327,39 @@ export const updateEmployee = async (req, res, next) => {
 export const deleteEmployee = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const employeeId = parseInt(id);
     
-    // Validate ID
-    if (isNaN(employeeId) || employeeId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid employee ID',
-        details: [{ field: 'id', message: 'Employee ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
       });
     }
 
-    const employee = await db.get('SELECT * FROM employees WHERE id = ?', [employeeId]);
+    const employee = await Employee.findById(id);
     if (!employee) {
       throw new NotFoundError('Employee not found');
     }
 
     // Check if employee has attendance records
-    const attendanceCount = await db.get(
-      'SELECT COUNT(*) as count FROM attendance WHERE employee_id = ?',
-      [employeeId]
-    );
+    const Attendance = (await import('../models/Attendance.js')).default;
+    const attendanceCount = await Attendance.countDocuments({ employee_id: id });
 
-    if (attendanceCount.count > 0) {
+    if (attendanceCount > 0) {
       return res.status(409).json({
         success: false,
         error: 'Conflict',
         message: 'Cannot delete employee with attendance records',
         details: [{ 
           field: 'employee_id', 
-          message: `Employee has ${attendanceCount.count} attendance record(s). Please delete attendance records first.` 
+          message: `Employee has ${attendanceCount} attendance record(s). Please delete attendance records first.` 
         }]
       });
     }
 
-    await db.run('DELETE FROM employees WHERE id = ?', [employeeId]);
+    await Employee.findByIdAndDelete(id);
     
     res.status(200).json({
       success: true,

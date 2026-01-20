@@ -63,8 +63,8 @@ export const employeeValidation = [
     .isLength({ min: 2, max: 100 }).withMessage('Position must be between 2 and 100 characters'),
   
   body('department_id')
-    .optional()
-    .isInt({ min: 1 }).withMessage('Department ID must be a positive integer'),
+    .notEmpty()
+    ,
   
   body('hire_date')
     .optional()
@@ -136,8 +136,8 @@ export const loginValidation = [
  */
 export const attendanceValidation = [
   body('employee_id')
-    .notEmpty().withMessage('Employee ID is required')
-    .isInt({ min: 1 }).withMessage('Employee ID must be a positive integer'),
+    .notEmpty().withMessage('Employee ID is required'),
+    // .isInt({ min: 1 }).withMessage('Employee ID must be a positive integer'),
   
   body('date')
     .notEmpty().withMessage('Date is required')
@@ -145,12 +145,12 @@ export const attendanceValidation = [
     .toDate(),
   
   body('check_in')
-    .optional()
-    .matches(/^([0-1][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$/).withMessage('Check-in time must be in HH:MM:SS format'),
+  .optional({ checkFalsy: true })
+  .matches(/^([0-1][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/).withMessage('Check-in time must be in HH:MM or HH:MM:SS format'),
   
   body('check_out')
-    .optional()
-    .matches(/^([0-1][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$/).withMessage('Check-out time must be in HH:MM:SS format'),
+    .optional({ checkFalsy: true })
+    .matches(/^([0-1][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/).withMessage('Check-out time must be in HH:MM or HH:MM:SS format'),
   
   body('status')
     .optional()
@@ -168,7 +168,7 @@ export const attendanceValidation = [
 export const idValidation = [
   param('id')
     .notEmpty().withMessage('ID is required')
-    .isInt({ min: 1 }).withMessage('ID must be a positive integer')
+    // .isInt({ min: 1 }).withMessage('ID must be a positive integer')
 ];
 
 /**

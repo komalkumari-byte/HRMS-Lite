@@ -1,22 +1,12 @@
-import db from '../config/database.js';
-import { NotFoundError, ConflictError, ValidationError } from '../middleware/errorHandler.js';
+import Attendance from '../models/Attendance.js';
+import Employee from '../models/Employee.js';
+import { NotFoundError, ConflictError } from '../middleware/errorHandler.js';
 
 export const getAllAttendance = async (req, res, next) => {
   try {
     const { date, employee_id, start_date, end_date } = req.query;
-    let query = `
-      SELECT a.*, 
-             e.first_name, 
-             e.last_name, 
-             e.email,
-             e.position,
-             d.name as department_name
-      FROM attendance a
-      INNER JOIN employees e ON a.employee_id = e.id
-      LEFT JOIN departments d ON e.department_id = d.id
-      WHERE 1=1
-    `;
-    const params = [];
+    
+    let query = {};
 
     if (date) {
       // Validate date format
@@ -28,22 +18,24 @@ export const getAllAttendance = async (req, res, next) => {
           details: [{ field: 'date', message: 'Date must be in YYYY-MM-DD format' }]
         });
       }
-      query += ` AND a.date = ?`;
-      params.push(date);
+      const dateObj = new Date(date);
+      dateObj.setHours(0, 0, 0, 0);
+      const nextDay = new Date(dateObj);
+      nextDay.setDate(nextDay.getDate() + 1);
+      query.date = { $gte: dateObj, $lt: nextDay };
     }
 
     if (employee_id) {
-      const empId = parseInt(employee_id);
-      if (isNaN(empId) || empId < 1) {
+      // Validate MongoDB ObjectId
+      if (!/^[0-9a-fA-F]{24}$/.test(employee_id)) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Invalid employee ID',
-          details: [{ field: 'employee_id', message: 'Employee ID must be a positive integer' }]
+          details: [{ field: 'employee_id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
         });
       }
-      query += ` AND a.employee_id = ?`;
-      params.push(empId);
+      query.employee_id = employee_id;
     }
 
     if (start_date && end_date) {
@@ -55,18 +47,41 @@ export const getAllAttendance = async (req, res, next) => {
           details: [{ field: 'start_date/end_date', message: 'Dates must be in YYYY-MM-DD format' }]
         });
       }
-      query += ` AND a.date BETWEEN ? AND ?`;
-      params.push(start_date, end_date);
+      const startDate = new Date(start_date);
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(end_date);
+      endDate.setHours(23, 59, 59, 999);
+      query.date = { $gte: startDate, $lte: endDate };
     }
 
-    query += ` ORDER BY a.date DESC, e.first_name ASC`;
+    const attendance = await Attendance.find(query)
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .sort({ date: -1, 'employee_id.first_name': 1 })
+      .lean();
 
-    const attendance = await db.all(query, params);
-    
+    // Format response
+    const formattedAttendance = attendance.map(att => ({
+      ...att,
+      id: att._id,
+      employee_id: att.employee_id?._id || att.employee_id,
+      first_name: att.employee_id?.first_name,
+      last_name: att.employee_id?.last_name,
+      email: att.employee_id?.email,
+      position: att.employee_id?.position,
+      department_name: att.employee_id?.department_id?.name || null
+    }));
+
     res.status(200).json({
       success: true,
-      data: attendance,
-      count: attendance.length
+      data: formattedAttendance,
+      count: formattedAttendance.length
     });
   } catch (error) {
     next(error);
@@ -76,38 +91,47 @@ export const getAllAttendance = async (req, res, next) => {
 export const getAttendanceById = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const attendanceId = parseInt(id);
     
-    if (isNaN(attendanceId) || attendanceId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid attendance ID',
-        details: [{ field: 'id', message: 'Attendance ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Attendance ID must be a valid MongoDB ObjectId' }]
       });
     }
 
-    const attendance = await db.get(
-      `SELECT a.*, 
-              e.first_name, 
-              e.last_name, 
-              e.email,
-              e.position,
-              d.name as department_name
-       FROM attendance a
-       INNER JOIN employees e ON a.employee_id = e.id
-       LEFT JOIN departments d ON e.department_id = d.id
-       WHERE a.id = ?`,
-      [attendanceId]
-    );
+    const attendance = await Attendance.findById(id)
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .lean();
 
     if (!attendance) {
       throw new NotFoundError('Attendance record not found');
     }
 
+    // Format response
+    const formattedAttendance = {
+      ...attendance,
+      id: attendance._id,
+      employee_id: attendance.employee_id?._id || attendance.employee_id,
+      first_name: attendance.employee_id?.first_name,
+      last_name: attendance.employee_id?.last_name,
+      email: attendance.employee_id?.email,
+      position: attendance.employee_id?.position,
+      department_name: attendance.employee_id?.department_id?.name || null
+    };
+
     res.status(200).json({
       success: true,
-      data: attendance
+      data: formattedAttendance
     });
   } catch (error) {
     next(error);
@@ -118,17 +142,31 @@ export const createAttendance = async (req, res, next) => {
   try {
     const { employee_id, date, check_in, check_out, status, notes } = req.body;
 
+    // Validate employee_id
+    if (!/^[0-9a-fA-F]{24}$/.test(employee_id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid employee ID',
+        details: [{ field: 'employee_id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
+      });
+    }
+
     // Check if employee exists
-    const employee = await db.get('SELECT * FROM employees WHERE id = ?', [employee_id]);
+    const employee = await Employee.findById(employee_id);
     if (!employee) {
       throw new NotFoundError('Employee not found');
     }
 
-    // Check if attendance already exists for this date (duplicate handling)
-    const existing = await db.get(
-      'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
-      [employee_id, date]
-    );
+    // Parse date
+    const dateObj = new Date(date);
+    dateObj.setHours(0, 0, 0, 0);
+
+    // Check if attendance already exists for this date
+    const existing = await Attendance.findOne({
+      employee_id: employee_id,
+      date: dateObj
+    });
 
     if (existing) {
       throw new ConflictError('Attendance record already exists for this date');
@@ -151,39 +189,49 @@ export const createAttendance = async (req, res, next) => {
       }
     }
 
-    const result = await db.run(
-      `INSERT INTO attendance (employee_id, date, check_in, check_out, status, notes)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        parseInt(employee_id),
-        date,
-        check_in || null,
-        check_out || null,
-        status || 'present',
-        notes ? notes.trim() : null
-      ]
-    );
+    const attendance = new Attendance({
+      employee_id: employee_id,
+      date: dateObj,
+      check_in: check_in || null,
+      check_out: check_out || null,
+      status: status || 'present',
+      notes: notes ? notes.trim() : null
+    });
 
-    const attendance = await db.get(
-      `SELECT a.*, 
-              e.first_name, 
-              e.last_name, 
-              e.email,
-              e.position,
-              d.name as department_name
-       FROM attendance a
-       INNER JOIN employees e ON a.employee_id = e.id
-       LEFT JOIN departments d ON e.department_id = d.id
-       WHERE a.id = ?`,
-      [result.lastID]
-    );
+    await attendance.save();
+
+    const savedAttendance = await Attendance.findById(attendance._id)
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .lean();
+
+    // Format response
+    const formattedAttendance = {
+      ...savedAttendance,
+      id: savedAttendance._id,
+      employee_id: savedAttendance.employee_id?._id || savedAttendance.employee_id,
+      first_name: savedAttendance.employee_id?.first_name,
+      last_name: savedAttendance.employee_id?.last_name,
+      email: savedAttendance.employee_id?.email,
+      position: savedAttendance.employee_id?.position,
+      department_name: savedAttendance.employee_id?.department_id?.name || null
+    };
 
     res.status(201).json({
       success: true,
       message: 'Attendance record created successfully',
-      data: attendance
+      data: formattedAttendance
     });
   } catch (error) {
+    if (error.code === 11000) {
+      return next(new ConflictError('Attendance record already exists for this date'));
+    }
     next(error);
   }
 };
@@ -191,21 +239,21 @@ export const createAttendance = async (req, res, next) => {
 export const updateAttendance = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const attendanceId = parseInt(id);
     
-    if (isNaN(attendanceId) || attendanceId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid attendance ID',
-        details: [{ field: 'id', message: 'Attendance ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Attendance ID must be a valid MongoDB ObjectId' }]
       });
     }
 
     const { check_in, check_out, status, notes } = req.body;
 
     // Check if attendance exists
-    const existing = await db.get('SELECT * FROM attendance WHERE id = ?', [attendanceId]);
+    const existing = await Attendance.findById(id);
     if (!existing) {
       throw new NotFoundError('Attendance record not found');
     }
@@ -227,37 +275,41 @@ export const updateAttendance = async (req, res, next) => {
       }
     }
 
-    await db.run(
-      `UPDATE attendance 
-       SET check_in = ?, check_out = ?, status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [
-        check_in || null,
-        check_out || null,
-        status || existing.status,
-        notes !== undefined ? (notes ? notes.trim() : null) : existing.notes,
-        attendanceId
-      ]
-    );
+    // Update fields
+    if (check_in !== undefined) existing.check_in = check_in || null;
+    if (check_out !== undefined) existing.check_out = check_out || null;
+    if (status) existing.status = status;
+    if (notes !== undefined) existing.notes = notes ? notes.trim() : null;
 
-    const attendance = await db.get(
-      `SELECT a.*, 
-              e.first_name, 
-              e.last_name, 
-              e.email,
-              e.position,
-              d.name as department_name
-       FROM attendance a
-       INNER JOIN employees e ON a.employee_id = e.id
-       LEFT JOIN departments d ON e.department_id = d.id
-       WHERE a.id = ?`,
-      [attendanceId]
-    );
+    await existing.save();
+
+    const updatedAttendance = await Attendance.findById(id)
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .lean();
+
+    // Format response
+    const formattedAttendance = {
+      ...updatedAttendance,
+      id: updatedAttendance._id,
+      employee_id: updatedAttendance.employee_id?._id || updatedAttendance.employee_id,
+      first_name: updatedAttendance.employee_id?.first_name,
+      last_name: updatedAttendance.employee_id?.last_name,
+      email: updatedAttendance.employee_id?.email,
+      position: updatedAttendance.employee_id?.position,
+      department_name: updatedAttendance.employee_id?.department_id?.name || null
+    };
 
     res.status(200).json({
       success: true,
       message: 'Attendance record updated successfully',
-      data: attendance
+      data: formattedAttendance
     });
   } catch (error) {
     next(error);
@@ -267,23 +319,23 @@ export const updateAttendance = async (req, res, next) => {
 export const deleteAttendance = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const attendanceId = parseInt(id);
     
-    if (isNaN(attendanceId) || attendanceId < 1) {
+    // Validate MongoDB ObjectId
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
         message: 'Invalid attendance ID',
-        details: [{ field: 'id', message: 'Attendance ID must be a positive integer' }]
+        details: [{ field: 'id', message: 'Attendance ID must be a valid MongoDB ObjectId' }]
       });
     }
 
-    const attendance = await db.get('SELECT * FROM attendance WHERE id = ?', [attendanceId]);
+    const attendance = await Attendance.findById(id);
     if (!attendance) {
       throw new NotFoundError('Attendance record not found');
     }
 
-    await db.run('DELETE FROM attendance WHERE id = ?', [attendanceId]);
+    await Attendance.findByIdAndDelete(id);
     
     res.status(200).json({
       success: true,
@@ -298,8 +350,18 @@ export const markAttendance = async (req, res, next) => {
   try {
     const { employee_id, date, action } = req.body;
 
+    // Validate employee_id
+    if (!/^[0-9a-fA-F]{24}$/.test(employee_id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid employee ID',
+        details: [{ field: 'employee_id', message: 'Employee ID must be a valid MongoDB ObjectId' }]
+      });
+    }
+
     // Check if employee exists
-    const employee = await db.get('SELECT * FROM employees WHERE id = ?', [employee_id]);
+    const employee = await Employee.findById(employee_id);
     if (!employee) {
       throw new NotFoundError('Employee not found');
     }
@@ -308,11 +370,15 @@ export const markAttendance = async (req, res, next) => {
     const now = new Date();
     const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
+    // Parse date
+    const dateObj = new Date(date);
+    dateObj.setHours(0, 0, 0, 0);
+
     // Check if attendance record exists
-    let attendance = await db.get(
-      'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
-      [employee_id, date]
-    );
+    let attendance = await Attendance.findOne({
+      employee_id: employee_id,
+      date: dateObj
+    });
 
     if (action === 'check_in') {
       if (attendance && attendance.check_in) {
@@ -321,16 +387,18 @@ export const markAttendance = async (req, res, next) => {
 
       if (attendance) {
         // Update existing record
-        await db.run(
-          'UPDATE attendance SET check_in = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-          [time, 'present', attendance.id]
-        );
+        attendance.check_in = time;
+        attendance.status = 'present';
+        await attendance.save();
       } else {
         // Create new record
-        await db.run(
-          'INSERT INTO attendance (employee_id, date, check_in, status) VALUES (?, ?, ?, ?)',
-          [employee_id, date, time, 'present']
-        );
+        attendance = new Attendance({
+          employee_id: employee_id,
+          date: dateObj,
+          check_in: time,
+          status: 'present'
+        });
+        await attendance.save();
       }
     } else if (action === 'check_out') {
       if (!attendance) {
@@ -346,31 +414,38 @@ export const markAttendance = async (req, res, next) => {
         throw new ConflictError('Already checked out for this date');
       }
 
-      await db.run(
-        'UPDATE attendance SET check_out = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [time, attendance.id]
-      );
+      attendance.check_out = time;
+      await attendance.save();
     }
 
     // Return updated attendance record
-    attendance = await db.get(
-      `SELECT a.*, 
-              e.first_name, 
-              e.last_name, 
-              e.email,
-              e.position,
-              d.name as department_name
-       FROM attendance a
-       INNER JOIN employees e ON a.employee_id = e.id
-       LEFT JOIN departments d ON e.department_id = d.id
-       WHERE a.employee_id = ? AND a.date = ?`,
-      [employee_id, date]
-    );
+    const updatedAttendance = await Attendance.findById(attendance._id)
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .lean();
+
+    // Format response
+    const formattedAttendance = {
+      ...updatedAttendance,
+      id: updatedAttendance._id,
+      employee_id: updatedAttendance.employee_id?._id || updatedAttendance.employee_id,
+      first_name: updatedAttendance.employee_id?.first_name,
+      last_name: updatedAttendance.employee_id?.last_name,
+      email: updatedAttendance.employee_id?.email,
+      position: updatedAttendance.employee_id?.position,
+      department_name: updatedAttendance.employee_id?.department_id?.name || null
+    };
 
     res.status(200).json({
       success: true,
       message: `${action === 'check_in' ? 'Checked in' : 'Checked out'} successfully`,
-      data: attendance
+      data: formattedAttendance
     });
   } catch (error) {
     next(error);
@@ -381,94 +456,84 @@ export const getAttendanceStats = async (req, res, next) => {
   try {
     const { start_date, end_date } = req.query;
     
-    // Validate date format if provided
-    if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid start date format',
-        details: [{ field: 'start_date', message: 'Start date must be in YYYY-MM-DD format' }]
-      });
-    }
-    
-    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid end date format',
-        details: [{ field: 'end_date', message: 'End date must be in YYYY-MM-DD format' }]
-      });
-    }
-
-    let dateFilter = '';
-    const params = [];
+    let dateFilter = {};
     
     if (start_date && end_date) {
-      dateFilter = 'WHERE a.date BETWEEN ? AND ?';
-      params.push(start_date, end_date);
+      // Validate date format
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid date format',
+          details: [{ field: 'start_date/end_date', message: 'Dates must be in YYYY-MM-DD format' }]
+        });
+      }
+      const startDate = new Date(start_date);
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(end_date);
+      endDate.setHours(23, 59, 59, 999);
+      dateFilter.date = { $gte: startDate, $lte: endDate };
     }
 
     // Total attendance records
-    const totalRecords = await db.get(
-      `SELECT COUNT(*) as count FROM attendance ${dateFilter}`,
-      params
-    );
+    const totalRecords = await Attendance.countDocuments(dateFilter);
 
     // Present count
-    const presentParams = [...params];
-    const presentFilter = dateFilter 
-      ? `${dateFilter} AND status = 'present'`
-      : "WHERE status = 'present'";
-    const presentCount = await db.get(
-      `SELECT COUNT(*) as count FROM attendance ${presentFilter}`,
-      presentParams
-    );
+    const presentFilter = { ...dateFilter, status: 'present' };
+    const presentCount = await Attendance.countDocuments(presentFilter);
 
     // Absent count
-    const absentParams = [...params];
-    const absentFilter = dateFilter 
-      ? `${dateFilter} AND status = 'absent'`
-      : "WHERE status = 'absent'";
-    const absentCount = await db.get(
-      `SELECT COUNT(*) as count FROM attendance ${absentFilter}`,
-      absentParams
-    );
+    const absentFilter = { ...dateFilter, status: 'absent' };
+    const absentCount = await Attendance.countDocuments(absentFilter);
 
     // Late count (check-in after 9:00 AM)
-    const lateParams = [...params];
-    const lateFilter = dateFilter 
-      ? `${dateFilter} AND check_in > '09:00:00' AND status = 'present'`
-      : "WHERE check_in > '09:00:00' AND status = 'present'";
-    const lateCount = await db.get(
-      `SELECT COUNT(*) as count FROM attendance ${lateFilter}`,
-      lateParams
-    );
+    const lateFilter = { 
+      ...dateFilter, 
+      status: 'present',
+      check_in: { $gt: '09:00:00' }
+    };
+    const lateCount = await Attendance.countDocuments(lateFilter);
 
     // Today's attendance
-    const today = new Date().toISOString().split('T')[0];
-    const todayAttendance = await db.all(
-      `SELECT a.*, 
-              e.first_name, 
-              e.last_name, 
-              e.email,
-              e.position,
-              d.name as department_name
-       FROM attendance a
-       INNER JOIN employees e ON a.employee_id = e.id
-       LEFT JOIN departments d ON e.department_id = d.id
-       WHERE a.date = ?
-       ORDER BY e.first_name ASC`,
-      [today]
-    );
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const todayAttendance = await Attendance.find({
+      date: { $gte: today, $lt: tomorrow }
+    })
+      .populate({
+        path: 'employee_id',
+        select: 'first_name last_name email position',
+        populate: {
+          path: 'department_id',
+          select: 'name'
+        }
+      })
+      .sort({ 'employee_id.first_name': 1 })
+      .lean();
+
+    // Format today's attendance
+    const formattedTodayAttendance = todayAttendance.map(att => ({
+      ...att,
+      id: att._id,
+      employee_id: att.employee_id?._id || att.employee_id,
+      first_name: att.employee_id?.first_name,
+      last_name: att.employee_id?.last_name,
+      email: att.employee_id?.email,
+      position: att.employee_id?.position,
+      department_name: att.employee_id?.department_id?.name || null
+    }));
 
     res.status(200).json({
       success: true,
       data: {
-        totalRecords: totalRecords.count,
-        presentCount: presentCount.count,
-        absentCount: absentCount.count,
-        lateCount: lateCount.count,
-        todayAttendance
+        totalRecords,
+        presentCount,
+        absentCount,
+        lateCount,
+        todayAttendance: formattedTodayAttendance
       }
     });
   } catch (error) {

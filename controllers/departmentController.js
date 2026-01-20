@@ -1,178 +1,153 @@
-import db from '../config/database.js';
-import { NotFoundError, ConflictError } from '../middleware/errorHandler.js';
+import { validationResult } from 'express-validator';
+import Department from '../models/Department.js';
+import Employee from '../models/Employee.js';
 
-export const getAllDepartments = async (req, res, next) => {
+export const getAllDepartments = async (req, res) => {
   try {
-    const departments = await db.all(
-      `SELECT d.*, COUNT(e.id) as employee_count 
-       FROM departments d 
-       LEFT JOIN employees e ON d.id = e.department_id 
-       GROUP BY d.id 
-       ORDER BY d.name`
-    );
-    res.status(200).json({
-      success: true,
-      data: departments,
-      count: departments.length
-    });
+    const departments = await Department.aggregate([
+      {
+        $lookup: {
+          from: 'employees',
+          localField: '_id',
+          foreignField: 'department_id',
+          as: 'employees'
+        }
+      },
+      {
+        $addFields: {
+          employee_count: { $size: '$employees' }
+        }
+      },
+      {
+        $project: {
+          employees: 0
+        }
+      },
+      {
+        $sort: { name: 1 }
+      }
+    ]);
+    res.json(departments);
   } catch (error) {
-    next(error);
+    console.error('Get departments error:', error);
+    res.status(500).json({ error: 'Server error fetching departments' });
   }
 };
 
-export const getDepartmentById = async (req, res, next) => {
+export const getDepartmentById = async (req, res) => {
   try {
     const { id } = req.params;
-    const deptId = parseInt(id);
-    
-    if (isNaN(deptId) || deptId < 1) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid department ID',
-        details: [{ field: 'id', message: 'Department ID must be a positive integer' }]
-      });
-    }
-
-    const department = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
+    const department = await Department.findById(id);
 
     if (!department) {
-      throw new NotFoundError('Department not found');
+      return res.status(404).json({ error: 'Department not found' });
     }
 
     // Get employees in this department
-    const employees = await db.all(
-      'SELECT id, first_name, last_name, email, position FROM employees WHERE department_id = ?',
-      [deptId]
-    );
-    department.employees = employees;
+    const employees = await Employee.find({ department_id: id })
+      .select('first_name last_name email position')
+      .lean();
 
-    res.status(200).json({
-      success: true,
-      data: department
-    });
+    const departmentObj = department.toObject();
+    departmentObj.employees = employees;
+
+    res.json(departmentObj);
   } catch (error) {
-    next(error);
+    console.error('Get department error:', error);
+    res.status(500).json({ error: 'Server error fetching department' });
   }
 };
 
-export const createDepartment = async (req, res, next) => {
+export const createDepartment = async (req, res) => {
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { name, description } = req.body;
 
-    // Check if department already exists (duplicate handling)
-    const existing = await db.get('SELECT * FROM departments WHERE LOWER(name) = LOWER(?)', [name.trim()]);
+    // Check if department exists
+    const existing = await Department.findOne({ name: name.trim() });
     if (existing) {
-      throw new ConflictError('Department with this name already exists');
+      return res.status(400).json({ error: 'Department with this name already exists' });
     }
 
-    const result = await db.run(
-      'INSERT INTO departments (name, description) VALUES (?, ?)',
-      [name.trim(), description ? description.trim() : null]
-    );
-
-    const department = await db.get('SELECT * FROM departments WHERE id = ?', [result.lastID]);
-    
-    res.status(201).json({
-      success: true,
-      message: 'Department created successfully',
-      data: department
+    const department = new Department({
+      name: name.trim(),
+      description: description?.trim() || null
     });
+
+    await department.save();
+    res.status(201).json(department);
   } catch (error) {
-    next(error);
+    console.error('Create department error:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Department with this name already exists' });
+    }
+    res.status(500).json({ error: 'Server error creating department' });
   }
 };
 
-export const updateDepartment = async (req, res, next) => {
+export const updateDepartment = async (req, res) => {
   try {
-    const { id } = req.params;
-    const deptId = parseInt(id);
-    
-    if (isNaN(deptId) || deptId < 1) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid department ID',
-        details: [{ field: 'id', message: 'Department ID must be a positive integer' }]
-      });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
+    const { id } = req.params;
     const { name, description } = req.body;
 
-    const existing = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
-    if (!existing) {
-      throw new NotFoundError('Department not found');
+    const department = await Department.findById(id);
+    if (!department) {
+      return res.status(404).json({ error: 'Department not found' });
     }
 
-    // Check if name is taken by another department (duplicate handling)
-    if (name && name.trim().toLowerCase() !== existing.name.toLowerCase()) {
-      const nameExists = await db.get('SELECT * FROM departments WHERE LOWER(name) = LOWER(?) AND id != ?', [name.trim(), deptId]);
+    // Check if name is taken by another department
+    if (name !== department.name) {
+      const nameExists = await Department.findOne({ name: name.trim(), _id: { $ne: id } });
       if (nameExists) {
-        throw new ConflictError('Department name already taken');
+        return res.status(400).json({ error: 'Department name already taken' });
       }
     }
 
-    await db.run(
-      'UPDATE departments SET name = ?, description = ? WHERE id = ?',
-      [name ? name.trim() : existing.name, description !== undefined ? (description ? description.trim() : null) : existing.description, deptId]
-    );
+    department.name = name.trim();
+    department.description = description?.trim() || null;
+    await department.save();
 
-    const department = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
-    
-    res.status(200).json({
-      success: true,
-      message: 'Department updated successfully',
-      data: department
-    });
+    res.json(department);
   } catch (error) {
-    next(error);
+    console.error('Update department error:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Department name already taken' });
+    }
+    res.status(500).json({ error: 'Server error updating department' });
   }
 };
 
-export const deleteDepartment = async (req, res, next) => {
+export const deleteDepartment = async (req, res) => {
   try {
     const { id } = req.params;
-    const deptId = parseInt(id);
-    
-    if (isNaN(deptId) || deptId < 1) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid department ID',
-        details: [{ field: 'id', message: 'Department ID must be a positive integer' }]
-      });
-    }
 
-    const department = await db.get('SELECT * FROM departments WHERE id = ?', [deptId]);
+    const department = await Department.findById(id);
     if (!department) {
-      throw new NotFoundError('Department not found');
+      return res.status(404).json({ error: 'Department not found' });
     }
 
     // Check if department has employees
-    const employeeCount = await db.get(
-      'SELECT COUNT(*) as count FROM employees WHERE department_id = ?',
-      [deptId]
-    );
+    const employeeCount = await Employee.countDocuments({ department_id: id });
 
-    if (employeeCount.count > 0) {
-      return res.status(409).json({
-        success: false,
-        error: 'Conflict',
-        message: 'Cannot delete department with assigned employees',
-        details: [{ 
-          field: 'department_id', 
-          message: `Department has ${employeeCount.count} employee(s). Please reassign employees first.` 
-        }]
+    if (employeeCount > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete department with assigned employees. Please reassign employees first.' 
       });
     }
 
-    await db.run('DELETE FROM departments WHERE id = ?', [deptId]);
-    
-    res.status(200).json({
-      success: true,
-      message: 'Department deleted successfully'
-    });
+    await Department.findByIdAndDelete(id);
+    res.json({ message: 'Department deleted successfully' });
   } catch (error) {
-    next(error);
+    console.error('Delete department error:', error);
+    res.status(500).json({ error: 'Server error deleting department' });
   }
 };
